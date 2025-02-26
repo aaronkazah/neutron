@@ -8,8 +8,7 @@ from fastembed import TextEmbedding
 
 class Vectors:
     def __init__(self):
-        self.embedding_model = TextEmbedding(
-        )
+        self.embedding_model = TextEmbedding()
 
     def _generate_sync(self, text: Union[str, Iterable[str]]) -> np.ndarray:
         """Synchronous wrapper for the embedding generation"""

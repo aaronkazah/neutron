@@ -286,7 +286,9 @@ class SQLiteSchemaEditor(BaseSchemaEditor):
         await self.create_table(new_table, new_fields)
 
         # Copy data - only include columns that exist in both tables
-        remaining_columns = [col["name"] for col in columns if col["name"] != field_name]
+        remaining_columns = [
+            col["name"] for col in columns if col["name"] != field_name
+        ]
         columns_str = ", ".join(remaining_columns)
 
         try:
@@ -314,8 +316,7 @@ class SQLiteSchemaEditor(BaseSchemaEditor):
         # Create new table with all columns including the new one
         new_table = f"{model_name}_new"
         new_fields = [
-            (col["name"], self._create_field_from_column(col))
-            for col in columns
+            (col["name"], self._create_field_from_column(col)) for col in columns
         ]
         # Add the new field
         new_fields.append((field_name, field))

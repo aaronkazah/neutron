@@ -135,6 +135,7 @@ class AddField(Operation):
     def describe(self):
         return f"AddField('{self.model_name}', '{self.field_name}', {self.field.describe()})"
 
+
 class RemoveField(Operation):
     def __init__(self, model_name, field_name):
         self.model_name = model_name

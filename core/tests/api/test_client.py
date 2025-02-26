@@ -4,7 +4,6 @@ from unittest.mock import Mock
 from typing import Dict, Any
 
 from core.client import InvalidResourceNameError, APIClient
-from core import settings
 from core.resources import Resource
 
 
@@ -22,7 +21,7 @@ class TestAPIClient(unittest.IsolatedAsyncioTestCase):
         """Set up test case"""
         self.client = APIClient(
             base_url="http://testserver",
-            api_key=settings.SECRET_KEY,
+            api_key=None,
             prefix="v1",
             resources=["Customer", "Order"],
             timeout=30,
@@ -37,7 +36,7 @@ class TestAPIClient(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(InvalidResourceNameError):
             APIClient(
                 base_url="http://testserver",
-                api_key=settings.SECRET_KEY,
+                api_key=None,
                 resources=["invalid_name"],
             )
 

@@ -9,7 +9,7 @@ from json import JSONEncoder
 from typing import Any, List, Tuple, Callable, Optional, Dict, TypeVar
 from urllib.parse import parse_qs
 
-from core import exceptions, settings
+from core import exceptions
 from core.db.model import Model
 from core.utils import Status
 
