@@ -1,5 +1,5 @@
 from core.api import API
-from core.utils import Status
+from core.utils.http import Status
 
 
 class HealthAPI(API):

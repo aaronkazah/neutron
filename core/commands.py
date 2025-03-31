@@ -117,9 +117,6 @@ async def makemigrations_command(args: List[str]) -> None:
                 app_label=app_label, models=models, return_ops=False, clean=False
             )
 
-            print(
-                f"{'Created new migration' if operations else 'No changes detected'} for {app_label}"
-            )
 
     except ImportError:
         print(
@@ -171,6 +168,8 @@ async def start_command(args: List[str]) -> None:
         from core.db.migrations import MigrationManager
         from core.db.base import DATABASES
 
+        os.environ.setdefault("ENV", ".env")
+
         clear_restart()
 
         watch_paths = ["apps", "core", ".env"]
@@ -179,12 +178,13 @@ async def start_command(args: List[str]) -> None:
         # Initialize database
         manager = MigrationManager(base_dir="apps")
         await manager.bootstrap_all(test_mode=False)
+        PORT = os.getenv("PORT", 7777)
 
         # Configure server
         config = uvicorn.Config(
-            app="app:app",  # This should be configurable
+            app="apps.entry:app",
             host="0.0.0.0",
-            port=8000,
+            port=PORT,
             log_level="debug",
             reload=False,
         )
@@ -213,10 +213,38 @@ async def start_command(args: List[str]) -> None:
 @register_command("test")
 def test_command(args: List[str]) -> None:
     """Run the test suite."""
-    logging.basicConfig(level=logging.ERROR)
+    verbosity = 1
+    test_args = []
+
+    # Check for -v or --verbose flags
+    for i, arg in enumerate(args):
+        if arg == "-v" or arg.startswith("--verbose"):
+            if arg == "-v" and i + 1 < len(args) and args[i + 1].isdigit():
+                verbosity = int(args[i + 1])
+                # Skip the next argument since it's the verbosity level
+                continue
+            elif arg.startswith("-v") and len(arg) > 2 and arg[2:].isdigit():
+                verbosity = int(arg[2:])
+            else:
+                verbosity = 3  # Max verbosity for --verbose
+        else:
+            test_args.append(arg)
+
+    # Set logging level based on verbosity
+    if verbosity >= 3:
+        logging.basicConfig(level=logging.DEBUG)
+        print(f"Running tests with DEBUG logging level (verbosity {verbosity})")
+    elif verbosity == 2:
+        logging.basicConfig(level=logging.INFO)
+    else:
+        logging.basicConfig(level=logging.ERROR)
+
+    # Always keep subprocess logging at WARNING level to avoid noise
     logging.getLogger("asyncio.subprocess").setLevel(logging.WARNING)
 
     try:
+        os.environ.setdefault("ENV", ".env")
+        from apps.entry import app
         from core.db.base import DATABASES
 
         DATABASES.configure_app("test", memory=True)
@@ -224,15 +252,15 @@ def test_command(args: List[str]) -> None:
         print("Warning: Running tests without database support")
 
     loader = unittest.TestLoader()
-    runner = unittest.TextTestRunner(verbosity=2)
+    runner = unittest.TextTestRunner(verbosity=verbosity)
 
     try:
-        if args:
-            if args[0].startswith("apps.") or args[0].startswith("core."):
-                suite = loader.loadTestsFromName(args[0])
+        if test_args:
+            if test_args[0].startswith("apps.") or test_args[0].startswith("core."):
+                suite = loader.loadTestsFromName(test_args[0])
             else:
-                pattern = args[0] if args[0].endswith(".py") else "test*.py"
-                start_dir = args[0] if os.path.isdir(args[0]) else "."
+                pattern = test_args[0] if test_args[0].endswith(".py") else "test*.py"
+                start_dir = test_args[0] if os.path.isdir(test_args[0]) else "."
                 suite = loader.discover(start_dir=start_dir, pattern=pattern)
         else:
             suite = unittest.TestSuite()

@@ -14,7 +14,7 @@ from core.db.migrations import MigrationManager
 from core.db.model import Model
 from core.db.base import DATABASES, BASE_PRAGMAS
 
-
+# Make sure Model.get_app_label() returns values that match database configurations
 class BaseModel(Model):
     """Base model class with common functionality."""
 
@@ -30,7 +30,6 @@ class BaseModel(Model):
     def get_table_name(cls) -> str:
         """Override to return simple test table name."""
         return f"test_app_{cls.__name__.lower()}"
-
 
 class Network(BaseModel):
     name: str = CharField()

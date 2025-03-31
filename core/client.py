@@ -1,11 +1,9 @@
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional, List, Type, Set, Any, Union
-import httpx
-import re
+from typing import List, Set, Any, Union
 
-from core.api import create_application
-from core.resources import Resource, ResourceError
+
+from core.resources import ResourceError
 
 from typing import Dict, Optional, Type
 import httpx
@@ -40,6 +38,7 @@ class APIClient:
         pluralize=True,
         resource_methods: Dict[str, Dict[str, dict]] = None,
         force_local=False,
+        headers: Optional[Dict[str, str]] = None,
     ):
         """Initialize API client with configuration."""
         self.base_url = base_url.rstrip("/")
@@ -54,6 +53,7 @@ class APIClient:
         self.pluralize = pluralize
         self._resource_methods = resource_methods or {}
         self.force_local = force_local
+        self.headers = headers or {}
 
         # Validate resource names at initialization
         for resource in self._allowed_resources:
@@ -90,7 +90,6 @@ class APIClient:
             )
             self._client = client
 
-        client.headers.update(self._get_headers())
         return client
 
     def _serialize_request_data(
@@ -190,11 +189,18 @@ class APIClient:
                 files = request_data.pop("files", {})
                 data = self._serialize_request_data(request_data, is_multipart=True)
                 response = await cls.client.request(
-                    method, endpoint, files=files, data=data
+                    method,
+                    endpoint,
+                    files=files,
+                    data=data,
+                    headers=cls.client._get_headers(),  # Use instance headers
                 )
             else:
                 response = await cls.client.request(
-                    method, endpoint, json=self._serialize_request_data(request_data)
+                    method,
+                    endpoint,
+                    json=self._serialize_request_data(request_data),
+                    headers=cls.client._get_headers(),  # Use instance headers
                 )
 
             if response.status_code >= 400:
@@ -241,7 +247,15 @@ class APIClient:
             headers["X-API-Key"] = self._api_key
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
+
+        # Add custom headers
+        headers.update(self.headers)
+
         return headers
+
+    def set_headers(self, headers: Dict[str, str]) -> None:
+        """Set or update custom headers."""
+        self.headers.update(headers)
 
     async def request(
         self,
@@ -251,6 +265,7 @@ class APIClient:
         json: Optional[Dict] = None,
         data: Optional[Dict] = None,
         files: Optional[Dict] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> httpx.Response:
         """Make an HTTP request to the API."""
         url = f"{path}"
@@ -258,6 +273,11 @@ class APIClient:
             url = f"{self.prefix.rstrip('/')}/{url.lstrip('/')}"
 
         kwargs = {"params": params}
+
+        # Use explicitly provided headers or get them from the instance
+        if headers is None:
+            headers = self._get_headers()
+        kwargs["headers"] = headers
 
         if files:
             kwargs["files"] = files

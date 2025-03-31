@@ -9,3 +9,4 @@ uvicorn==0.34.0
 watchdog==6.0.0
 inflection==0.5.1
 aiofiles==24.1.0
+asyncpg==0.30.0

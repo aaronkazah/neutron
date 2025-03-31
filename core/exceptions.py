@@ -1,6 +1,9 @@
-from core.utils import Status
+from core.utils.http import Status
 
 
+class DatabaseError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
 class APIException(Exception):
     def __init__(
         self,
@@ -92,4 +95,12 @@ class IntegrityError(APIException):
 
 
 class DoesNotExist(APIException):
+    pass
+
+
+class AuthenticationError(APIException):
+    pass
+
+
+class AuthorizationError(APIException):
     pass

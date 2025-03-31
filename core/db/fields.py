@@ -570,7 +570,27 @@ class IntegerField(BaseField):
         return int(value)
 
 
+# In core/db/fields.py, update the BooleanField class to handle database differences
+
 class BooleanField(BaseField):
+    def __init__(
+            self,
+            db_column=None,
+            null=False,
+            default=None,
+            unique=False,
+            blank=False,
+            primary_key=False,
+    ):
+        super().__init__(
+            db_column=db_column,
+            null=null,
+            blank=blank,
+            default=default,
+            unique=unique,
+            primary_key=primary_key,
+            max_length=None,
+        )
 
     def describe(self):
         """Returns a string representation of the field with its parameters"""
@@ -587,17 +607,35 @@ class BooleanField(BaseField):
             raise ValueError("BooleanField cannot be null.")
 
     def to_db(self, value):
+        """Convert boolean to database format, respecting database type differences."""
         if isinstance(value, BaseField):
             value = value.value
-        value = int(value)
-        self.value = value
-        return self.value
+
+        if value is None:
+            return None
+
+        # Convert to boolean first (handle "truthy" values)
+        bool_value = bool(value)
+
+        # Store the boolean value
+        self.value = bool_value
+
+        # For SQLite, integers are used for booleans
+        # For PostgreSQL, native boolean values are used
+        # Let the database adapter handle the conversion
+        return bool_value
 
     def from_db(self, value):
+        """Convert from database format to Python boolean."""
+        if value is None:
+            return None
+
+        # Whether it's an int (SQLite) or bool (PostgreSQL), convert to Python bool
         return bool(value)
 
     def get_db_type(self):
-        return "INTEGER"
+        """Return the database column type."""
+        return "INTEGER"  # Used by SQLite; PostgreSQL will use BOOLEAN instead
 
 
 class FloatField(BaseField):
@@ -665,6 +703,8 @@ class FloatField(BaseField):
         return float(value)
 
 
+# In core/db/fields.py, update the JSONField class
+
 class JSONField(BaseField):
     def __init__(self, db_column=None, null=False, default=None):
         super().__init__(
@@ -674,25 +714,51 @@ class JSONField(BaseField):
         )
 
     def to_db(self, value: Union[dict, list] = None) -> Optional[str]:
+        """Convert Python object to database JSON format."""
         if value is None:
             return None
-        if isinstance(value, dict):
+
+        # Handle instances of BaseField
+        if isinstance(value, BaseField):
+            value = value.value
+
+        # Convert dictionary, list, or callable
+        if isinstance(value, (dict, list)):
             self.value = value
-            return json.dumps(self.value)
-        elif isinstance(value, list):
-            self.value = value
-            return json.dumps(self.value)
-        if callable(value):
+            return json.dumps(value)
+        elif callable(value):
             self.value = value()
             return json.dumps(self.value)
-
         else:
-            raise exceptions.ValidationError("Invalid value type for JSONField")
+            # Try to serialize other types, if possible
+            try:
+                return json.dumps(value)
+            except (TypeError, ValueError):
+                raise exceptions.ValidationError(f"Invalid value type for JSONField: {type(value)}")
 
     def from_db(self, value=None) -> Any:
-        if value is not None:
-            self.value = json.loads(value)
-        return self.value
+        """Convert database JSON value to Python object."""
+        if value is None:
+            return None
+
+        # PostgreSQL drivers often return already-parsed objects
+        if isinstance(value, (dict, list)):
+            self.value = value
+            return value
+
+        # SQLite returns JSON as strings that need to be parsed
+        if isinstance(value, str):
+            try:
+                self.value = json.loads(value)
+                return self.value
+            except json.JSONDecodeError:
+                # If it can't be decoded as JSON, return as is
+                self.value = value
+                return value
+
+        # Otherwise just return the value
+        self.value = value
+        return value
 
     def get(self, param, param1) -> Any:
         return self.value.get(param, param1)
@@ -704,7 +770,40 @@ class JSONField(BaseField):
         self.value[key] = value
 
     def get_db_type(self):
+        # This is used by SQLite
         return "TEXT"
+
+    def describe(self):
+        """Returns a string representation of the field with its parameters"""
+        params = []
+        if self.null:
+            params.append("null=True")
+
+        # --- CORRECTED DEFAULT HANDLING ---
+        if self.default is not None:
+            default_repr = ""
+            if self.default is dict: # Check specifically for the dict class itself
+                default_repr = "dict"
+            elif self.default is list: # Check specifically for the list class itself
+                default_repr = "list"
+            elif callable(self.default):
+                # Try to get the name of other callables
+                try:
+                    default_repr = self.default.__name__
+                except AttributeError:
+                    # Fallback for callables without a standard name (e.g., complex lambdas)
+                    default_repr = repr(self.default) # Use repr as a fallback
+            else:
+                # For non-callable default values (e.g., {}, [], None, True) use repr()
+                default_repr = repr(self.default)
+
+            params.append(f"default={default_repr}")
+        # --- END CORRECTION ---
+
+        if self.db_column is not None:
+            params.append(f"db_column='{self.db_column}'")
+
+        return f"JSONField({', '.join(params)})"
 
 
 class VectorField(BaseField):

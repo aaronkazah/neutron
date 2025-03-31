@@ -2,12 +2,12 @@
 import datetime
 import json
 from enum import Enum
-from typing import Type, TypeVar, List, Optional, Tuple, Any
+from typing import Type, TypeVar, List, Optional, Tuple, Any, Union, Dict
 
 import aiosqlite
 import numpy as np
-from core.db.fields import VectorField, DateTimeField
-from core.db.base import DATABASES
+from core.db.fields import DateTimeField
+from core.db.base import DATABASES, DatabaseType
 
 T = TypeVar("T", bound="Model")  # Type variable for models
 
@@ -77,14 +77,25 @@ class QuerySet(LazyQuerySet):
 
     def __init__(self, model_cls: Type["Model"]):
         super().__init__()
+        if not hasattr(model_cls, '_fields'):
+            raise TypeError("QuerySet must be initialized with a Model class.")
         self.model_cls = model_cls
-        self.db_alias = model_cls.db_alias
+
+        # For backward compatibility, use the model's db_alias if set as a class attribute
+        model_db_alias = getattr(model_cls, "db_alias", None)
+        if model_db_alias:
+            self.db_alias = model_db_alias
+        else:
+            # Determine default alias using the router based on the model's app label
+            app_label = self.model_cls.get_app_label()
+            self.db_alias = DATABASES.router.db_for_app(app_label)
+
         self.filters = []
-        self.ordering = None
-        self.limit_value = None
-        self._last_method = None
-        self._result_cache = None
-        self._fetch_attempted = False
+        self.excludes = []
+        self.ordering: Optional[List[str]] = None
+        self.limit_value: Optional[int] = None
+        self.offset_value: Optional[int] = None
+        self._last_method = None  # Initialize _last_method attribute
 
     def _clone(self):
         """Create a copy of the current queryset."""
@@ -107,9 +118,12 @@ class QuerySet(LazyQuerySet):
         return converted
 
     def using(self, db_alias: str) -> "QuerySet":
-        """Set the database alias to be used for this query."""
-        self.db_alias = db_alias
-        return self
+        """Set the database alias to be used for this query chain."""
+        if not db_alias: raise ValueError("Database alias cannot be empty.")
+
+        new_qs = self._clone()
+        new_qs.db_alias = db_alias
+        return new_qs
 
     def filter(self, **kwargs):
         new_qs = self._clone()
@@ -174,17 +188,38 @@ class QuerySet(LazyQuerySet):
     async def count(self) -> int:
         """Count the number of records matching the conditions."""
         db = await DATABASES.get_connection(self.db_alias)
-        table_name = self.model_cls.get_table_name()
-        conditions, values, _ = self._build_conditions()
-        condition_str = " AND ".join(conditions) if conditions else "1"
-        query = f"SELECT COUNT(*) as count FROM {table_name} WHERE {condition_str}"
 
-        cursor = await db.execute(query, tuple(values))
-        row = await cursor.fetchone()
-        return row["count"] if row else 0
+        # Check if this is PostgreSQL database
+        is_postgres = getattr(db, 'db_type', None) == DatabaseType.POSTGRES
+
+        if is_postgres:
+            # Get schema and table from _get_parsed_table_name
+            schema, table = self.model_cls._get_parsed_table_name()
+            # Use fully schema-qualified table name
+            table_identifier = f'"{schema}"."{table}"'
+        else:
+            # For SQLite, use the regular table name
+            table_name = self.model_cls.get_table_name()
+            table_identifier = f'"{table_name}"'
+
+        conditions, values, _ = self._build_conditions()
+
+        # Create proper condition string based on DB type
+        if conditions:
+            condition_str = " AND ".join(conditions)
+        else:
+            # Use TRUE for PostgreSQL, 1 for SQLite
+            condition_str = "TRUE" if is_postgres else "1"
+
+        query = f"SELECT COUNT(*) as count FROM {table_identifier} WHERE {condition_str}"
+
+        result = await db.fetch_one(query, tuple(values))
+        return result["count"] if result else 0
 
     async def create(self, **kwargs):
         """Create a new record in the database by instantiating and saving the model."""
+        if 'db_alias' not in kwargs:
+            kwargs['db_alias'] = self.db_alias
         converted_kwargs = self._convert_enum_values(kwargs)
         instance = self.model_cls(**converted_kwargs)
         instance.db_alias = self.db_alias
@@ -279,31 +314,62 @@ class QuerySet(LazyQuerySet):
 
     async def bulk_update(self, objs: List[T], fields: List[str]) -> None:
         db = await DATABASES.get_connection(self.db_alias)
-        table_name = self.model_cls.get_table_name()
+        is_postgres = getattr(db, 'db_type', None) == DatabaseType.POSTGRES
+
+        # --- CORRECTED: Get schema-qualified table name for PG ---
+        schema, table = self.model_cls._get_parsed_table_name()
+        table_identifier = f'"{schema}"."{table}"' if is_postgres else f'"{self.model_cls.get_table_name()}"'
+        # --- END CORRECTION ---
 
         if not objs or not fields:
             return
 
-        set_clause = ", ".join(f"{field} = ?" for field in fields)
-        query = f"UPDATE {table_name} SET {set_clause} WHERE id = ?"
+        # --- CORRECTED: Build SET clause with correct placeholders ---
+        set_parts = []
+        param_index = 1
+        for field in fields:
+            placeholder = f'${param_index}' if is_postgres else '?'
+            set_parts.append(f'"{field}" = {placeholder}') # Quote field name
+            param_index += 1
+        set_clause = ", ".join(set_parts)
+        pk_placeholder = f'${param_index}' if is_postgres else '?'
+        # --- END CORRECTION ---
+
+        # --- CORRECTED: Quote ID column ---
+        query = f'UPDATE {table_identifier} SET {set_clause} WHERE "id" = {pk_placeholder}'
+        # --- END CORRECTION ---
+
         values = []
         for obj in objs:
             row_values = [
                 self.model_cls._fields[field].to_db(getattr(obj, field))
                 for field in fields
             ]
+            # Add PK value at the end
             row_values.append(obj.id)
-            values.append(tuple(row_values))
+            # --- CORRECTED: Use list for asyncpg, tuple for sqlite ---
+            values.append(row_values if is_postgres else tuple(row_values))
+            # --- END CORRECTION ---
 
         try:
             await db.executemany(query, values)
-            await db.commit()
-        except aiosqlite.OperationalError as e:
-            raise e
+            # Commit is often handled by the DatabaseInfo/ConnectionManager now,
+            # but explicitly committing here might be needed depending on transaction control.
+            # If tests fail again due to transaction issues, uncomment below.
+            # await db.commit()
+        except Exception as e:
+            self.model_cls.logger.error(f"Bulk update failed: {e}. Query: {query}", exc_info=True)
+            raise e # Re-raise original error for clarity
 
     async def bulk_delete(self, objs: List[T]) -> None:
         db = await DATABASES.get_connection(self.db_alias)
-        table_name = self.model_cls.get_table_name()
+        is_postgres = getattr(db, 'db_type', None) == DatabaseType.POSTGRES
+
+        # --- CORRECTED: Get schema-qualified table name for PG ---
+        schema, table = self.model_cls._get_parsed_table_name()
+        table_identifier = f'"{schema}"."{table}"' if is_postgres else f'"{self.model_cls.get_table_name()}"'
+        # --- END CORRECTION ---
+
 
         if not objs:
             return
@@ -312,14 +378,26 @@ class QuerySet(LazyQuerySet):
         if not ids:
             return
 
-        placeholders = ", ".join("?" for _ in ids)
-        query = f"DELETE FROM {table_name} WHERE id IN ({placeholders})"
+        # --- CORRECTED: Use correct placeholders and table identifier ---
+        if is_postgres:
+            placeholders = ", ".join(f"${i+1}" for i in range(len(ids)))
+            query = f'DELETE FROM {table_identifier} WHERE "id" IN ({placeholders})' # Quote id column
+            values_tuple = ids # asyncpg expects a list
+        else:
+            placeholders = ", ".join("?" for _ in ids)
+            query = f'DELETE FROM {table_identifier} WHERE "id" IN ({placeholders})' # Quote id column
+            values_tuple = tuple(ids) # aiosqlite expects a tuple
+        # --- END CORRECTION ---
 
         try:
-            await db.execute(query, tuple(ids))
-            await db.commit()
-        except aiosqlite.OperationalError as e:
-            raise e
+            # Use execute, not executemany for IN clause
+            await db.execute(query, values_tuple)
+            # Commit might be implicit depending on db_info implementation
+            # await db.commit() # Uncomment if necessary
+        except Exception as e:
+             # Log error with details
+             self.model_cls.logger.error(f"Bulk delete failed: {e}. Query: {query}, Values: {values_tuple}", exc_info=True)
+             raise e
 
     def all(self) -> "QuerySet":
         """Return a new QuerySet that is a copy of the current one."""
@@ -328,11 +406,24 @@ class QuerySet(LazyQuerySet):
     async def _fetch_all(self) -> List[T]:
         """Get all records that match the current filters."""
         db = await DATABASES.get_connection(self.db_alias)
-        table_name = self.model_cls.get_table_name()
+
+        # Check if this is PostgreSQL database
+        is_postgres = getattr(db, 'db_type', None) == DatabaseType.POSTGRES
+
+        if is_postgres:
+            # Get schema and table from _get_parsed_table_name
+            schema, table = self.model_cls._get_parsed_table_name()
+            # Use fully schema-qualified table name
+            table_identifier = f'"{schema}"."{table}"'
+        else:
+            # For SQLite, use the regular table name
+            table_name = self.model_cls.get_table_name()
+            table_identifier = f'"{table_name}"'
+
+        # Build query with proper table identifier
         sql_conditions, sql_values, json_filters = self._build_conditions()
         condition_str = " AND ".join(sql_conditions) if sql_conditions else "1"
-
-        query = f"SELECT * FROM {table_name} WHERE {condition_str}"
+        query = f'SELECT * FROM {table_identifier} WHERE {condition_str}'
 
         if self.ordering:
             query += f" ORDER BY {self.ordering}"
@@ -341,14 +432,18 @@ class QuerySet(LazyQuerySet):
             query += f" LIMIT {self.limit_value}"
 
         try:
-            cursor = await db.execute(query, tuple(sql_values))
-            rows = await cursor.fetchall()
+            rows = await db.fetch_all(query, tuple(sql_values))
         except Exception as e:
+            print(f"Error in _fetch_all executing query: {query}")
+            print(f"Values: {sql_values}")
+            print(f"Database Alias: {self.db_alias}")
+            print(f"Database Object Type: {type(db)}")
             raise e
 
+        # Instantiate model objects from the rows
         records = [self.model_cls.from_row(row, db_alias=self.db_alias) for row in rows]
 
-        # Process JSON filters
+        # Process JSON filters (remains the same)
         for field_name, lookup_path, value, negate in json_filters:
             filtered_records = []
             for obj in records:
@@ -477,6 +572,19 @@ class QuerySet(LazyQuerySet):
         sql_values = []
         json_filters = []
 
+        # Determine if the connection for the current db_alias is PostgreSQL
+        is_postgres = False
+        # Check DATABASES existence and router attribute first
+        if hasattr(DATABASES, 'CONNECTIONS') and hasattr(DATABASES, 'router'):
+            # Use the router to find the target alias for the model's app label
+            target_alias = DATABASES.router.db_for_app(self.model_cls.get_app_label())
+            db_info = DATABASES.CONNECTIONS.get(target_alias)  # Check connection using the target alias
+            if db_info and getattr(db_info, 'db_type', None) == DatabaseType.POSTGRES:
+                is_postgres = True
+        # Note: This check assumes a connection might already exist.
+        # A more robust check might involve looking at the CONFIG for the target_alias
+        # if no connection is present yet, but that adds complexity.
+
         # Convert any Enum values in filters first
         processed_filters = {}
         for key, value in filters.items():
@@ -489,20 +597,55 @@ class QuerySet(LazyQuerySet):
         for key, value in processed_filters.items():
             parts = key.split("__")
             field_name = parts[0]
+            # Ensure field name is quoted for safety, especially with reserved words
+            quoted_field_name = f'"{field_name}"'
+
             lookup_type = parts[-1] if len(parts) > 1 else "exact"
 
             # Special handling for datetime fields
             field = self.model_cls._fields.get(field_name)
             if isinstance(field, DateTimeField):
                 if isinstance(value, datetime.datetime):
-                    value = value.isoformat()
+                    value = value.isoformat()  # Convert datetime to ISO string for DB
 
-            if field_name in self.model_cls._json_fields and len(parts) > 1:
-                if lookup_type == "isnull":
-                    json_filters.append((field_name, parts[1:], value, negate))
-                else:
-                    json_filters.append((field_name, parts[1:], value, negate))
+            if field_name in getattr(self.model_cls, "_json_fields", []) and len(parts) > 1:
+                if is_postgres:
+                    # PostgreSQL JSON handling
+                    if lookup_type == "contains":
+                        # Remove quotes if string is quoted (PostgreSQL JSONB contains works better without outer quotes for simple strings)
+                        if isinstance(value, str) and len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+                            value_to_check = value[1:-1]
+                        else:
+                            value_to_check = value
+                        # Use PostgreSQL containment operator '@>' with a single placeholder
+                        # We need to wrap the value in JSON structure for the operator
+                        sql_conditions.append(f"{quoted_field_name}::jsonb @> ?::jsonb")
+                        # Handle different value types correctly for JSON contains
+                        if isinstance(value_to_check, (dict, list)):
+                            sql_values.append(json.dumps(value_to_check))
+                        elif isinstance(value_to_check, str):
+                            # For string containment, check if the string exists as a value or key
+                            # A simple string value check needs to be wrapped in JSON array/object
+                            # This example assumes checking if the string exists as a top-level value in an array or dict value
+                            # More complex logic might be needed for nested checks via SQL only
+                            sql_values.append(json.dumps([value_to_check]))  # Check if string is in top-level array
+                            # Or potentially: sql_values.append(f'"{value_to_check}"') # If checking for exact JSON string value
+                        else:
+                            # For numbers or booleans, wrap them appropriately
+                            sql_values.append(json.dumps(value_to_check))
+
+                        continue  # Skip adding to Python-based json_filters
+
+                    elif lookup_type == "has":
+                        # Use PostgreSQL has key operator '?' with a single placeholder
+                        sql_conditions.append(f"{quoted_field_name}::jsonb ? ?")  # Generate SQL with '?'
+                        sql_values.append(str(value))  # The key must be a string
+                        continue  # Skip adding to Python-based json_filters
+
+                # Default behavior for SQLite or other unhandled PostgreSQL cases (Python-based filtering)
+                json_filters.append((field_name, parts[1:], value, negate))
             else:
+                # Handle regular field lookups
                 if lookup_type in [
                     "contains",
                     "icontains",
@@ -511,6 +654,17 @@ class QuerySet(LazyQuerySet):
                     "endswith",
                     "iendswith",
                 ]:
+                    # Prepare value for LIKE operator
+                    # Note: icontains/istartswith/iendswith might need specific handling for PostgreSQL (ILIKE)
+                    # vs SQLite (COLLATE NOCASE)
+                    pg_like_operator = "LIKE"
+                    sqlite_like_operator = "LIKE"
+                    collate_nocase = ""  # For SQLite
+
+                    if lookup_type in ["icontains", "istartswith", "iendswith"]:
+                        pg_like_operator = "ILIKE"  # Use ILIKE for case-insensitive in PG
+                        collate_nocase = " COLLATE NOCASE"  # Use COLLATE for SQLite
+
                     if lookup_type in ["contains", "icontains"]:
                         value = f"%{value}%"
                     elif lookup_type in ["startswith", "istartswith"]:
@@ -518,26 +672,63 @@ class QuerySet(LazyQuerySet):
                     elif lookup_type in ["endswith", "iendswith"]:
                         value = f"%{value}"
 
-                if lookup_type == "in":
+                    # Choose operator based on DB type
+                    chosen_like_operator = pg_like_operator if is_postgres else sqlite_like_operator
+                    chosen_collate = "" if is_postgres else collate_nocase
+                    operator_sql = f"{chosen_like_operator} ?{chosen_collate}"
+
+                    if negate:
+                        operator_sql = f"NOT {operator_sql}"
+
+                    sql_conditions.append(f"{quoted_field_name} {operator_sql}")
+                    sql_values.append(value)
+
+                elif lookup_type == "in":
                     # Handle Enum values in lists
                     processed_value = [
                         v.value if isinstance(v, Enum) else v for v in value
                     ]
-                    placeholders = ", ".join(["?"] * len(processed_value))
-                    operator = self.LOOKUP_OPERATORS["in"].format(placeholders)
-                    sql_conditions.append(f"{field_name} {operator}")
-                    sql_values.extend(processed_value)
+                    if not processed_value:  # Handle empty list case
+                        # WHERE id IN () is invalid SQL, effectively means "match nothing"
+                        # Add a condition that is always false
+                        sql_conditions.append("1 = 0")
+                    else:
+                        placeholders = ", ".join(["?"] * len(processed_value))
+                        operator = self.LOOKUP_OPERATORS["in"].format(placeholders)
+                        if negate:
+                            operator = f"NOT {operator}"
+                        sql_conditions.append(f"{quoted_field_name} {operator}")  # Use quoted field name
+                        sql_values.extend(processed_value)
+
                 elif lookup_type == "isnull":
                     operator = "IS NULL" if value else "IS NOT NULL"
-                    sql_conditions.append(f"{field_name} {operator}")
-                else:
-                    operator = self.LOOKUP_OPERATORS.get(lookup_type, "= ?")
                     if negate:
-                        if operator == "= ?":
-                            operator = "!= ?"
-                        elif operator.startswith("LIKE"):
-                            operator = operator.replace("LIKE", "NOT LIKE")
-                    sql_conditions.append(f"{field_name} {operator}")
+                        operator = "IS NOT NULL" if value else "IS NULL"
+                    sql_conditions.append(f"{quoted_field_name} {operator}")  # Use quoted field name
+                    # No value needed for IS NULL / IS NOT NULL
+
+                else:
+                    # Handle exact, gt, gte, lt, lte etc.
+                    base_operator = self.LOOKUP_OPERATORS.get(lookup_type)
+                    if not base_operator:
+                        # If lookup_type isn't in operators, assume it's part of the field name (e.g., json lookup fallback)
+                        # This path shouldn't be hit if JSON fields are handled above, but as a safety measure:
+                        print(
+                            f"Warning: Unrecognized lookup type '{lookup_type}' for non-JSON field '{field_name}'. Treating as exact match.")
+                        base_operator = "= ?"  # Default to exact match
+
+                    # Apply negation if needed
+                    if negate:
+                        if base_operator == "= ?":
+                            base_operator = "!= ?"
+                        elif base_operator == "IS NULL":
+                            base_operator = "IS NOT NULL"
+                        # Add more negation logic if necessary (e.g., NOT LIKE, NOT BETWEEN)
+                        else:
+                            # Generic negation (might not work for all operators, e.g. LIKE)
+                            base_operator = f"NOT ({base_operator})"
+
+                    sql_conditions.append(f"{quoted_field_name} {base_operator}")  # Use quoted field name
                     sql_values.append(value)
 
         return sql_conditions, sql_values, json_filters

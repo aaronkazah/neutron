@@ -10,8 +10,7 @@ from typing import Any, List, Tuple, Callable, Optional, Dict, TypeVar
 from urllib.parse import parse_qs
 
 from core import exceptions
-from core.db.model import Model
-from core.utils import Status
+from core.utils.http import Status
 
 T = TypeVar("T", bound="Model")
 
@@ -131,6 +130,7 @@ class API:
         self.kwargs = {}
         self.permission_classes = permission_classes or []
         self.throttle_classes = throttle_classes or []
+        self.authentication_class = authentication_class or self.authentication_class
 
         # Allow overriding configuration via init
         if page_size is not None:
@@ -565,7 +565,6 @@ class API:
                         import cgi
                         from io import BytesIO
 
-                        boundary = content_type.split("boundary=")[1]
                         environ = {
                             "REQUEST_METHOD": "POST",
                             "CONTENT_TYPE": content_type,
@@ -1002,10 +1001,12 @@ class Router:
 
         for api_name, api in self.apis.items():
             try:
+
                 # Attempt to match the path against each API
                 handler, kwargs, permission_classes, throttle_classes, _, _ = (
                     await api.match(path, method)
                 )
+
                 if handler:
                     await api.handle(scope, receive, send, **kwargs)
                     return
@@ -1025,62 +1026,6 @@ class Router:
             raise ValueError(f"API '{name}' not found.")
 
 
-class InternalAccessMiddleware:
-    def __init__(self, router: Callable):
-        self.router = router
-
-    async def __call__(self, scope: Dict, receive: Callable, send: Callable, **kwargs):
-        if scope["type"] != "http":
-            await self.router(scope, receive, send, **kwargs)
-            return
-
-        path = scope.get("path", "")
-
-        # Check if the path starts with /internal
-        if path.startswith("/internal"):
-            # Get headers from scope
-            headers = dict(scope.get("headers", []))
-            api_key = headers.get(b"x-api-key", b"").decode("utf-8")
-
-            # Check for valid API key
-            if self.is_valid_api_key(api_key):
-                await self.router(scope, receive, send, **kwargs)
-                return
-
-            await self.send_unauthorized_response(send)
-            return
-
-        await self.router(scope, receive, send, **kwargs)
-
-    def is_valid_api_key(self, api_key: str) -> bool:
-        try:
-            return api_key == settings.SECRET_KEY
-        except AttributeError:
-            return False
-
-    async def send_unauthorized_response(self, send: Callable):
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 401,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                ],
-            }
-        )
-        await send(
-            {
-                "type": "http.response.body",
-                "body": b'{"error": "Invalid or missing API key for internal endpoint"}',
-            }
-        )
-
-    def reverse(self, name: str, **kwargs) -> str:
-        """Reverse URL lookup for a named route across all registered APIs."""
-        return self.router.reverse(name, **kwargs)
-
-
 def create_application(apis: Dict[str, API]):
     router = Router(apis)
-    internal_middleware = InternalAccessMiddleware(router)
-    return CORS(internal_middleware, allow_all_origins=True)
+    return CORS(router, allow_all_origins=True)

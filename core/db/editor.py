@@ -18,7 +18,8 @@ from core.db.fields import (
     FloatField,
     BinaryField,
 )
-from core.db.base import DatabaseInfo, DatabaseType
+from core.db.base import DatabaseInfo
+from core.db.postgres import PostgresSchemaEditor
 
 
 class BaseSchemaEditor:
@@ -28,9 +29,9 @@ class BaseSchemaEditor:
         self.connection = database
         self.database_type = database.db_type
         self.logger = logging.getLogger("SchemaEditor")
+        self.logger.setLevel(logging.ERROR)
 
     async def execute(self, sql: str, params: Optional[dict] = None):
-        self.logger.info("Executing: %s with params %s", sql, params)
         try:
             await self.connection.execute(query=sql, values=params)
         except Exception as e:
@@ -69,13 +70,26 @@ class BaseSchemaEditor:
 
 
 class SQLiteSchemaEditor(BaseSchemaEditor):
-    async def table_exists(self, model_name: str) -> bool:
-        query = """
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name=?
-        """
-        result = await self.connection.fetch_one(query=query, values=[model_name])
-        return bool(result)
+    async def table_exists(self, app_label_or_table_name: str, table_base_name: Optional[str] = None) -> bool:
+        """Check if a table exists in SQLite."""
+        # SQLite doesn't use schemas, combine names if both provided
+        if table_base_name:
+            table_name_to_check = f"{app_label_or_table_name}_{table_base_name}"
+        else:
+            table_name_to_check = app_label_or_table_name
+
+        # The SQL query uses a placeholder '?'
+        query = "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+
+        try:
+            # Use fetch_one which returns None if not found
+            # --- FIX: Pass the UNQUOTED table name as the parameter value ---
+            result = await self.connection.fetch_one(query=query, values=[table_name_to_check])
+            return result is not None
+        except Exception as e:
+            self.logger.error(f"Error checking table existence for '{table_name_to_check}': {e}", exc_info=True)
+            # If an error occurs (e.g., connection closed), assume it doesn't exist or re-raise
+            return False  # Or re-raise depending on desired strictness
 
     async def rename_column(self, model_name: str, old_name: str, new_name: str):
         """Rename column in SQLite (requires table rebuild)"""
@@ -157,35 +171,150 @@ class SQLiteSchemaEditor(BaseSchemaEditor):
 
         return field_class(**field_kwargs)
 
-    async def alter_column(self, model_name: str, field_name: str, field: Any):
+    async def alter_column(self, app_label: str, table_base_name: str, field_name: str, field: Any):
         """Alter column in SQLite (requires table rebuild)"""
-        all_tables = await self.all_tables()
-        # Get current table info
-        columns = await self.get_column_info(model_name)
+        # Construct the full table name from app_label and table_base_name
+        table_name = f"{app_label}_{table_base_name}"
+        quoted_table_name = f'"{table_name}"' # Quote the name
 
-        # Create new table
-        new_table = f"{model_name}_new"
+        self.logger.debug(f"Altering column '{field_name}' in table '{table_name}'")
+        # await self.all_tables() # Usually not needed here
+
+        # Get current table info using the constructed table_name
+        try:
+            columns = await self.get_column_info(table_name)
+            if not columns:
+                self.logger.error(f"Cannot alter column: Table '{table_name}' not found or has no columns.")
+                raise ValueError(f"Table '{table_name}' not found for altering column.")
+        except Exception as e:
+            self.logger.error(f"Error getting column info for '{table_name}' during alter_column: {e}", exc_info=True)
+            raise
+
+        # Create new table definition
+        new_table_name_temp = f"{table_name}_alter_temp"
+        quoted_new_table_name_temp = f'"{new_table_name_temp}"'
         new_fields = []
+        found_column_to_alter = False
 
         for col in columns:
-            if col["name"] == field_name:
+            current_col_name = col["name"]
+            if current_col_name == field_name:
+                # Use the new field definition for the altered column
                 new_fields.append((field_name, field))
+                found_column_to_alter = True
             else:
-                # Create field without await
-                old_field = self._create_field_from_column(col)
-                new_fields.append((col["name"], old_field))
+                # Keep the old field definition for other columns
+                # Create field instance from existing column info
+                old_field = self._create_field_from_column(col) # Ensure this helper works correctly
+                new_fields.append((current_col_name, old_field))
 
-        await self.create_table(new_table, new_fields)
+        if not found_column_to_alter:
+            self.logger.error(f"Column '{field_name}' not found in table '{table_name}' during alter operation.")
+            # Depending on desired behavior, you might raise an error or just log and return
+            raise ValueError(f"Column '{field_name}' to alter not found in table '{table_name}'.")
 
-        # Copy data
-        columns_str = ", ".join(col["name"] for col in columns)
-        await self.execute(
-            f"INSERT INTO {new_table} ({columns_str}) SELECT {columns_str} FROM {model_name}"
-        )
 
-        # Replace old table
-        await self.drop_table(model_name)
-        await self.rename_table(new_table, model_name)
+        # --- Rebuild Table Logic ---
+        try:
+            # 1. Create the new table with the altered definition
+            # Pass app_label and the temporary base name to create_table
+            temp_base_name = f"{table_base_name}_alter_temp"
+            await self.create_table(app_label, temp_base_name, new_fields)
+
+            # 2. Copy data from old table to new table
+            # Ensure column names are quoted correctly
+            columns_str = ", ".join(f'"{col["name"]}"' for col in columns)
+            insert_sql = f"INSERT INTO {quoted_new_table_name_temp} ({columns_str}) SELECT {columns_str} FROM {quoted_table_name}"
+            await self.execute(insert_sql)
+
+            # 3. Drop the old table
+            await self.drop_table(table_name) # Pass the original full table name
+
+            # 4. Rename the new table to the original name
+            # Use the rename_table method which expects app labels and base names
+            await self.rename_table(app_label, temp_base_name, app_label, table_base_name)
+
+            self.logger.debug(f"Successfully altered column '{field_name}' in table '{table_name}'.")
+
+        except Exception as e:
+            self.logger.error(f"Error during table rebuild for alter_column on '{table_name}': {e}", exc_info=True)
+            # Attempt cleanup: drop the temporary table if it exists
+            try:
+                # Construct temp table name again for cleanup
+                temp_full_name = f"{app_label}_{table_base_name}_alter_temp"
+                await self.drop_table(temp_full_name)
+            except Exception as cleanup_err:
+                self.logger.error(f"Failed to drop temporary table '{temp_full_name}' after alter error: {cleanup_err}")
+            raise # Re-raise the original error
+
+    # --- FIX THE remove_column METHOD SIGNATURE AND USAGE ---
+    async def remove_column(self, app_label: str, table_base_name: str, field_name: str):
+        """Remove column in SQLite (requires table rebuild)"""
+        # Construct the full table name
+        table_name = f"{app_label}_{table_base_name}"
+        quoted_table_name = f'"{table_name}"'
+
+        self.logger.debug(f"Removing column '{field_name}' from table '{table_name}'")
+
+        # Get current table info
+        try:
+            columns = await self.get_column_info(table_name)
+            if not columns:
+                 self.logger.error(f"Cannot remove column: Table '{table_name}' not found or has no columns.")
+                 raise ValueError(f"Table '{table_name}' not found for removing column.")
+        except Exception as e:
+            self.logger.error(f"Error getting column info for '{table_name}' during remove_column: {e}", exc_info=True)
+            raise
+
+        # Check if the column to remove actually exists
+        if not any(col["name"] == field_name for col in columns):
+            self.logger.warning(f"Column '{field_name}' not found in table '{table_name}'. Skipping removal.")
+            return # Nothing to do if column doesn't exist
+
+        # --- Rebuild Table Logic ---
+        new_table_name_temp = f"{table_name}_remove_temp"
+        quoted_new_table_name_temp = f'"{new_table_name_temp}"'
+
+        try:
+            # 1. Create new table definition without the column
+            new_fields = []
+            remaining_columns_names = [] # Keep track of names for INSERT/SELECT
+            for col in columns:
+                if col["name"] != field_name:
+                    field = self._create_field_from_column(col)
+                    new_fields.append((col["name"], field))
+                    remaining_columns_names.append(f'"{col["name"]}"') # Quote for safety
+
+            if not new_fields:
+                self.logger.error(f"Cannot remove column '{field_name}': Removing it would leave table '{table_name}' with no columns.")
+                raise ValueError(f"Cannot remove last column '{field_name}' from table '{table_name}'.")
+
+            # Create the new table
+            temp_base_name = f"{table_base_name}_remove_temp"
+            await self.create_table(app_label, temp_base_name, new_fields)
+
+            # 2. Copy data - only include columns that exist in both tables
+            columns_to_select_str = ", ".join(remaining_columns_names)
+            insert_sql = f"INSERT INTO {quoted_new_table_name_temp} ({columns_to_select_str}) SELECT {columns_to_select_str} FROM {quoted_table_name}"
+            await self.execute(insert_sql)
+
+            # 3. Drop the old table
+            await self.drop_table(table_name) # Pass original full name
+
+            # 4. Rename the new table to the original name
+            await self.rename_table(app_label, temp_base_name, app_label, table_base_name)
+
+            self.logger.debug(f"Successfully removed column '{field_name}' from table '{table_name}'.")
+
+        except Exception as e:
+            self.logger.error(f"Error during table rebuild for remove_column on '{table_name}': {e}", exc_info=True)
+            # Attempt cleanup
+            try:
+                temp_full_name = f"{app_label}_{table_base_name}_remove_temp"
+                await self.drop_table(temp_full_name)
+            except Exception as cleanup_err:
+                self.logger.error(f"Failed to drop temporary table '{temp_full_name}' after remove error: {cleanup_err}")
+            raise # Re-raise original error
 
     async def get_column_info(self, model_name: str) -> List[dict]:
         query = f"PRAGMA table_info({model_name})"
@@ -203,12 +332,9 @@ class SQLiteSchemaEditor(BaseSchemaEditor):
         ]
 
     def get_column_type(self, field) -> str:
+        """Map Django field types to SQLite column types."""
         type_mapping = {
-            CharField: lambda f: (
-                f"VARCHAR({f.max_length})"
-                if hasattr(f, "max_length") and f.max_length
-                else "VARCHAR"
-            ),
+            CharField: "TEXT",  # Always use TEXT for CharField regardless of max_length
             TextField: "TEXT",
             IntegerField: "INTEGER",
             BooleanField: "INTEGER",
@@ -226,40 +352,79 @@ class SQLiteSchemaEditor(BaseSchemaEditor):
         if not column_type:
             raise ValueError(f"Unsupported field type: {field_type}")
 
+        # Handle callable mappings if needed in the future
         if callable(column_type):
             return column_type(field)
 
         return column_type
 
-    async def create_table(self, table_name: str, fields: List[Tuple[str, Any]]):
-        """Create a new table in SQLite"""
-        if await self.table_exists(table_name):
+    # Inside class SQLiteSchemaEditor in core/db/editor.py
+
+    async def create_table(self, app_label: str, table_base_name: str,
+                           fields: List[Tuple[str, BaseField]]):  # Use BaseField hint
+        """Create a new table in SQLite using the combined app_label_table_base_name format."""
+        table_name = f"{app_label}_{table_base_name}"
+        quoted_table_name = f'"{table_name}"'  # Quote combined name
+
+        # Check existence using the combined name
+        exists = await self.table_exists(table_name)
+        if exists:
+            self.logger.warning(f"SQLite table '{table_name}' already exists, skipping.")
             return
 
         field_definitions = []
+        primary_keys = []
+        has_explicit_pk = False
+
         for field_name, field in fields:
+            if not isinstance(field, BaseField):
+                # Log error and skip this field or raise error? Raising is safer.
+                self.logger.error(f"Invalid field type for '{field_name}' in table '{table_name}': {type(field)}")
+                raise TypeError(f"Invalid field type provided for '{field_name}': {type(field)}")
+
             column_type = self.get_column_type(field)
+            quoted_field_name = f'"{field_name}"'  # Quote field name
+            parts = [f"{quoted_field_name} {column_type}"]
 
-            # Build column definition
-            parts = [f"{field_name} {column_type}"]
-
+            # Handle PK constraints separately
             if field.primary_key:
-                parts.append("PRIMARY KEY")
-            if not field.null:
+                primary_keys.append(quoted_field_name)
+                has_explicit_pk = True
+                # SQLite implicitly adds NOT NULL to PRIMARY KEY columns
+
+            if not field.null and not field.primary_key:  # Don't add NOT NULL if PK
                 parts.append("NOT NULL")
             if field.unique:
-                parts.append("UNIQUE")
+                # SQLite needs UNIQUE constraint defined separately or inline for single column
+                parts.append("UNIQUE")  # Inline UNIQUE is fine for single column
             if field.default is not None:
-                parts.append(f"DEFAULT {self._process_default_value(field.default)}")
+                default_sql = self._process_default_value(field.default)
+                if default_sql is not None:  # Check if processing yielded a value
+                    parts.append(f"DEFAULT {default_sql}")
 
             field_definitions.append(" ".join(parts))
 
-        create_table_sql = f"""
-            CREATE TABLE {table_name} (
-                {", ".join(field_definitions)}
-            )
-        """
-        await self.execute(create_table_sql)
+        # Add PRIMARY KEY constraint at the end if defined
+        if primary_keys:
+            # For SQLite, if it's a single integer PK, defining it inline is common for auto-increment behavior.
+            # However, defining it at the end works for single or composite keys.
+            field_definitions.append(f"PRIMARY KEY ({', '.join(primary_keys)})")
+        elif not has_explicit_pk:
+            # Let SQLite handle its implicit ROWID if no PK is specified.
+            pass
+
+        # Construct the final SQL
+        create_table_sql = f"CREATE TABLE {quoted_table_name} ({', '.join(field_definitions)})"
+
+        # --- Add Logging ---
+        # --- End Logging ---
+
+        try:
+            await self.execute(create_table_sql)
+        except Exception as e:
+            self.logger.error(f"Failed to execute CREATE TABLE for '{table_name}'. SQL: {create_table_sql}",
+                              exc_info=True)
+            raise  # Re-raise the exception
 
     async def drop_table(self, model_name: str):
         """Drop table in SQLite"""
@@ -270,86 +435,75 @@ class SQLiteSchemaEditor(BaseSchemaEditor):
         columns = await self.get_column_info(model_name)
         return any(col["name"] == column_name for col in columns)
 
-    async def remove_column(self, model_name: str, field_name: str):
-        """Remove column in SQLite (requires table rebuild)"""
-        # Get current table info
-        columns = await self.get_column_info(model_name)
+    async def add_column(self, app_label: str, table_base_name: str, field_name: str, field: Any):
+        """Add column in SQLite - simplified version that directly alters the table"""
+        table_name = f"{app_label}_{table_base_name}"
 
-        # Create new table without the column
-        new_table = f"{model_name}_new"
-        new_fields = [
-            (col["name"], self._create_field_from_column(col))
-            for col in columns
-            if col["name"] != field_name
-        ]
+        # Check if column already exists
+        columns = await self.get_column_info(table_name)
+        if any(col["name"] == field_name for col in columns):
+            self.logger.info(f"Column '{field_name}' already exists in table '{table_name}', skipping.")
+            return
 
-        await self.create_table(new_table, new_fields)
+        # Get column definition
+        column_type = self.get_column_type(field)
+        column_def = f"{field_name} {column_type}"
 
-        # Copy data - only include columns that exist in both tables
-        remaining_columns = [
-            col["name"] for col in columns if col["name"] != field_name
-        ]
-        columns_str = ", ".join(remaining_columns)
+        # Add NOT NULL constraint if field is not nullable
+        if not field.null:
+            column_def += " NOT NULL"
 
+        # Add DEFAULT clause if field has a default value
+        if field.default is not None:
+            default_value = self._process_default_value(field.default)
+            column_def += f" DEFAULT {default_value}"
+
+        # Execute ALTER TABLE directly
+        alter_stmt = f'ALTER TABLE "{table_name}" ADD COLUMN {column_def}'
         try:
-            await self.execute(
-                f"INSERT INTO {new_table} ({columns_str}) SELECT {columns_str} FROM {model_name}"
-            )
+            await self.execute(alter_stmt)
         except Exception as e:
-            # If something goes wrong, clean up the new table
-            await self.drop_table(new_table)
-            raise e
+            self.logger.error(f"Error adding column '{field_name}' to '{table_name}': {e}")
+            raise
 
-        # Replace old table
-        await self.drop_table(model_name)
-        await self.rename_table(new_table, model_name)
+    async def rename_table(self, old_app_label: str, old_table_base_name: str, new_app_label: str,
+                           new_table_base_name: str):
+        """Rename table with proper handling of app prefixes"""
+        # Construct full table names with app prefixes
+        old_table_name = f"{old_app_label}_{old_table_base_name}"
+        new_table_name = f"{new_app_label}_{new_table_base_name}"
 
-    async def add_column(self, model_name: str, field_name: str, field: Any):
-        """Add column in SQLite"""
-        # First check if column exists
-        if await self.column_exists(model_name, field_name):
-            return  # Skip if column already exists
 
-        # Get the table's current columns
-        columns = await self.get_column_info(model_name)
+        # Verify old table exists
+        old_exists = await self.table_exists(old_table_name)
+        if not old_exists:
+            self.logger.error(f"Cannot rename table '{old_table_name}' because it doesn't exist")
+            raise ValueError(f"Table '{old_table_name}' does not exist")
 
-        # Create new table with all columns including the new one
-        new_table = f"{model_name}_new"
-        new_fields = [
-            (col["name"], self._create_field_from_column(col)) for col in columns
-        ]
-        # Add the new field
-        new_fields.append((field_name, field))
+        # Check if new table already exists
+        new_exists = await self.table_exists(new_table_name)
+        if new_exists:
+            self.logger.error(f"Cannot rename to '{new_table_name}' because it already exists")
+            raise ValueError(f"Target table '{new_table_name}' already exists")
 
-        await self.create_table(new_table, new_fields)
-
-        # Copy existing data
-        existing_columns = ", ".join(col["name"] for col in columns)
+        # Execute the rename
         try:
-            await self.execute(
-                f"INSERT INTO {new_table} ({existing_columns}) SELECT {existing_columns} FROM {model_name}"
-            )
-
-            # If the new column has a default value, update it
-            if field.default is not None:
-                default_value = self._process_default_value(field.default)
-                await self.execute(
-                    f"UPDATE {new_table} SET {field_name} = {default_value}"
-                )
+            await self.execute(f'ALTER TABLE "{old_table_name}" RENAME TO "{new_table_name}"')
         except Exception as e:
-            # If something goes wrong, clean up the new table
-            await self.drop_table(new_table)
-            raise e
-
-        # Replace old table
-        await self.drop_table(model_name)
-        await self.rename_table(new_table, model_name)
-
-    async def rename_table(self, old_name: str, new_name: str):
-        """Rename table in SQLite"""
-        await self.execute(f"ALTER TABLE {old_name} RENAME TO {new_name}")
+            self.logger.error(f"Error renaming table '{old_table_name}' to '{new_table_name}': {e}")
+            raise
 
 
-def get_schema_editor(database: DatabaseInfo) -> BaseSchemaEditor:
+def get_schema_editor(database: Any) -> PostgresSchemaEditor | SQLiteSchemaEditor:
     """Get appropriate schema editor based on database type"""
+    from core.db.base import DatabaseType
+
+    if hasattr(database, 'db_type'):
+        if database.db_type == DatabaseType.SQLITE:
+            return SQLiteSchemaEditor(database)
+        elif database.db_type == DatabaseType.POSTGRES:
+            from core.db.postgres import PostgresSchemaEditor
+            return PostgresSchemaEditor(database)
+
+    # Default to SQLite for backward compatibility
     return SQLiteSchemaEditor(database)

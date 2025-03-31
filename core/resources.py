@@ -1,10 +1,8 @@
 from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional, Type, ClassVar, Any
-import httpx
 import re
 import json
-from urllib.parse import urlencode
 from abc import ABC
 from inflection import pluralize
 from dataclasses import dataclass, field
@@ -139,8 +137,7 @@ class ResourceQuerySet:
                     # Create a new Resource instance with the response data
                     updated_resource = self.resource_class(data=response.json())
                     updated_resources.append(updated_resource)
-            except Exception as e:
-                # Log error if needed
+            except Exception:
                 continue
 
         # Return single Resource object if only one resource was updated

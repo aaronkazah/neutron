@@ -30,5 +30,8 @@ class EnvParser:
     def __getitem__(self, key):
         return self.variables[key]
 
+    def all(self):
+        return self.variables
 
-environ = EnvParser(os.environ.get("ENV"))
+
+environ = EnvParser(os.environ["ENV"])
